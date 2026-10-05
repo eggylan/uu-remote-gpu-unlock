@@ -16,8 +16,6 @@ if (-not (Test-Path $exe)) { throw "missing $exe - run build-shim.ps1 first" }
 $txt = [System.IO.File]::ReadAllText($tpl, [System.Text.Encoding]::UTF8)
 if ($txt.IndexOf("__SHIM_B64__") -lt 0) { throw "placeholder not found in template" }
 
-# Emit the base64 blob with the *template's* newline style, so the output never ends up
-# with mixed line endings whichever way git checks the file out.
 $nl = if ($txt.Contains("`r`n")) { "`r`n" } else { "`n" }
 
 $raw   = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($exe))
@@ -29,7 +27,24 @@ $b64 = [string]::Join($nl, $chunks)
 
 $final = $txt.Replace("__SHIM_B64__", $b64)
 
-[System.IO.File]::WriteAllText($out, $final, (New-Object System.Text.UTF8Encoding($true)))
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+[System.IO.File]::WriteAllText($out, $final, $utf8Bom)
+
+# sanity checks
+$errs = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile($out, [ref]$null, [ref]$errs)
+if ($errs.Count -gt 0) {
+    foreach ($e in $errs) { Write-Output ("  parse error line {0}: {1}" -f $e.Extent.StartLineNumber, $e.Message) }
+    throw "generated script has parse errors"
+}
+$lines = $final -split "`n"
+for ($i = 1; $i -lt $lines.Count; $i++) {
+    if (($lines[$i] -match '^\s*}\s*else\b') -and ($lines[$i - 1] -match '^\s*}\s*else\b')) {
+        throw ("generated script has a duplicated '} else {{' near line " + ($i + 1))
+    }
+}
+if (-not $final.Contains($b64.Substring(0, 120))) { throw "base64 blob not found in the output" }
+
 $f = Get-Item $out
-Write-Output ("wrote {0}  size={1}  exeB64={2} chars  newline={3}" -f `
+Write-Output ("wrote {0}  size={1}  exeB64={2} chars  newline={3}  (all self-checks passed)" -f `
     $f.FullName, $f.Length, $raw.Length, $(if ($nl -eq "`r`n") { "CRLF" } else { "LF" }))

@@ -9,14 +9,29 @@
 **安装补丁：**
 
 ```powershell
-# 1) 完全退出 UU（含托盘图标）
-# 2) 以管理员身份打开 PowerShell，切到 patch 目录
+# 1. 完全退出 UU（含托盘图标）
+# 2. 以管理员身份打开 PowerShell，切换至 patch 目录
 cd <本仓库>\patch
-# 3) 运行
+# 3. 运行
 powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1
 ```
 
 按照脚本指示操作即可。
+
+如需手动指定安装路径，使用 `-InstallDir` ：
+
+```powershell
+# 下面三种写法均可
+powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1 -InstallDir "D:\Netease\GameViewer"
+powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1 -InstallDir "D:\Netease\GameViewer\bin"
+powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1 -InstallDir "D:\Netease\GameViewer\bin\streamer.dll"
+```
+
+如需运行Dry Run：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1 -DryRun
+```
 
 **回滚**：
 
@@ -25,6 +40,18 @@ powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1 -Restore
 ```
 
 如果运行过程中产生异常，脚本会自动还原。
+
+### 参数
+
+| 参数 | 说明 |
+|---|---|
+| `-InstallDir <路径>` | 手动指定 UU 安装位置 |
+| `-Restore` | 还原为官方原版 |
+| `-DryRun` | 仅校验，不修改任何文件 |
+| `-WaitMinutes <n>` | 等待 UU 写出解码缓存的分钟数，默认 15 |
+| `-NoPrompt` | 不询问，直接结束占用安装目录的 UU 进程 |
+| `-KeepPatched` | 保留补丁 |
+| `-SkipAdminCheck` | 跳过管理员权限检查 |
 
 ## 原理
 
@@ -47,16 +74,16 @@ powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1 -Restore
 
 ### 原因
 
-`streamer.dll` 里的 `sub_1809B2310` 硬编码了GPU厂商：
+`streamer.dll` 里有一个硬编码GPU厂商的小函数：
 
 ```asm
 cmp  ecx, 0x10DE        ; NVIDIA：xor eax,eax ; ret
 cmp  ecx, 0x1002        ; AMD：mov eax,1   ; ret
 cmp  ecx, 0x8086        ; Intel：mov edx,2 ; cmove eax,edx ; ret
-mov  eax, 5             ; 其它：5
+mov  eax, 5             ; 其它厂商：5
 ```
 
-调用方 `sub_18095F5C0` 在统计可探测适配器时会跳过 class 5：
+调用方在统计可探测适配器时会跳过 class 5：
 
 ```c
 if (nodeClass != 5) { count += node.entries; }
@@ -75,11 +102,11 @@ if (!count) goto LABEL_67;
 
 #### 1. 白名单补丁
 
-```
-文件偏移 0x9B172F:  b8 05 00 00 00  (mov eax, 5)  ->  b8 02 00 00 00  (mov eax, 2)
-```
+把厂商分类代码里的默认返回值从 `5` 改为 `2`（Intel / DXVA11 类）：
 
-把默认返回值从 `5`（不受支持）改成 `2`（Intel / DXVA11 类）
+```
+b8 05 00 00 00  (mov eax, 5)  ->  b8 02 00 00 00  (mov eax, 2)
+```
 
 #### 2. GPU探测器
 
@@ -109,20 +136,17 @@ H.265 4:2:0 10bit 3840x2160  DXVA11
 
 ### 注意事项
 
-- UU升级会覆盖回原版DLL，届时重新运行补丁即可。
-- **解锁硬解不等于绝对没问题。** 如果解锁后出现卡顿、花屏、掉帧，说明GPU可能不兼容。用`-Restore`来回滚到软解。
-- 补丁的文件偏移与sha256版本相关。脚本内置了所验证版本的哈希，版本不符会拒绝执行。
+- UU升级会覆盖回原版DLL，届时重新运行补丁即可（脚本会自动重新定位补丁点）。
+- **解锁硬解不等于绝对没问题。** 如果解锁后出现卡顿、花屏、掉帧，说明GPU可能不兼容。还原补丁并删除 `<UU>\config\streamer\decoder_codec_capability_cache.json` 来回滚到软解。
 
 ### 已确认可用的版本
 
-| 项目 | 值 |
-|---|---|
-| UU 远程 | GameViewer 4.40.1.2090 |
-| `streamer.dll` SHA256 | `2DB8630CB0D73B54135FF972AD82FC053FDEFF5117E67C5DD295EC4020C73276` |
-| 补丁点 | 文件偏移 `0x9B172F`（RVA `0x9B232F` / VA `0x1809B232F`） |
-| 验证机 | Qualcomm Adreno 8cx Gen 3 |
+| UU 远程 | `streamer.dll` SHA256 | 补丁点 | 验证机 |
+|---|---|---|---|
+| GameViewer **4.42.0.2770** | `AB8ADE084C4F714FE5B21D1324B7E5D13E41BB036D4382E4BC231383B3D56E79` | `0x927A36` `0x927A73` `0x973E48` `0x9765C3` `0x9765F0` `0xB409CF` | Qualcomm Adreno 8cx Gen 3 |
+| GameViewer **4.40.1.2090** | `2DB8630CB0D73B54135FF972AD82FC053FDEFF5117E67C5DD295EC4020C73276` | `0x9B172F` | Qualcomm Adreno 8cx Gen 3 |
 
-其它版本可能偏移不同，可参考 `patch/` 下的脚本自行定位（思路：在 `streamer.dll` 里搜`10 DE` / `02 10` / `86 80`三个立即数相邻的那段小函数，改`mov eax,5` 的字节）
+不保证对后续版本的兼容性。如遇到问题，请提交Issue。
 
 ## 构建
 
@@ -139,12 +163,11 @@ Issue 地址：https://github.com/eggylan/uu-remote-gpu-unlock/issues
 
 - `%TEMP%\uu_detector_shim.log`
 - 脚本运行窗口的完整输出
-- `streamer.dll` 的 SHA256（`Get-FileHash <UU>\bin\streamer.dll -Algorithm SHA256`）
 - 显卡型号与 `DXGI_ADAPTER_DESC1` 的 `VendorId` / `DeviceId`
 
 ## 许可与免责声明
 
 - 本仓库以 **CC0 1.0 Universal** 发布，见 `LICENCE`。可自由使用、修改、再分发，无需署名。
 - 本仓库与网易/UU远程官方无关，没有隶属关系，亦未获其授权或认可。
-- 补丁会临时修改 `streamer.dll` 的 5 个字节，仅出于互操作目的，便于在官方未支持的硬件上使用。UU远程及其组件的版权归网易公司所有，本仓库不包含任何UU远程的二进制文件。
+- 补丁会修改 `streamer.dll` 中厂商分类代码的几个立即数字节，仅出于互操作目的，便于在官方未支持的硬件上使用。UU远程及其组件的版权归网易公司所有，本仓库不包含任何UU远程的二进制文件。
 - 本仓库仅供学习与研究。使用风险自负，请自行确保符合你所在地区的法律与软件许可条款。
