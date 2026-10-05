@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+.rll/
+
+DetectorShim.exe
