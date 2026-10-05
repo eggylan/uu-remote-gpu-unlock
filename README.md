@@ -142,6 +142,10 @@ Issue 地址：https://github.com/eggylan/uu-remote-gpu-unlock/issues
 - `streamer.dll` 的 SHA256（`Get-FileHash <UU>\bin\streamer.dll -Algorithm SHA256`）
 - 显卡型号与 `DXGI_ADAPTER_DESC1` 的 `VendorId` / `DeviceId`
 
+## 友情链接
+
+- [LINUX DO - 新的理想型社区](https://linux.do/)
+
 ## 许可与免责声明
 
 - 本仓库以 **CC0 1.0 Universal** 发布，见 `LICENCE`。可自由使用、修改、再分发，无需署名。
