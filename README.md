@@ -10,8 +10,9 @@
 
 ```powershell
 # 1. 完全退出 UU（含托盘图标）
-# 2. 以管理员身份打开 PowerShell，切换至 patch 目录
-cd <本仓库>\patch
+# 2. 克隆仓库，以管理员身份打开 PowerShell，切换至 patch 目录
+git clone https://github.com/eggylan/uu-remote-gpu-unlock.git
+cd uu-remote-gpu-unlock\patch
 # 3. 运行
 powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1
 ```
