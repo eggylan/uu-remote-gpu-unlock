@@ -6,5 +6,6 @@ Thumbs.db
 .idea/
 *.swp
 .rll/
+.temp
 
 DetectorShim.exe

@@ -12,17 +12,34 @@ param(
 $ErrorActionPreference = "Stop"
 
 
+#  两种补丁方案
+#    probe：4.46 起。解码能力探测里有 "厂商分类 == 5 就跳过" 的判断，未知厂商的显卡
+#           根本进不了 DXVA11 探测，于是缓存写不出来。本方案只改这个判断，让未知厂商
+#           的显卡也能被 DXVA11 探测到。不动厂商分类本身，编码器仍走软件路径，
+#           因此不会再误入 Intel oneVPL。
+#    class：4.42 及更早。把厂商分类里未知厂商的默认返回值 5 改成 2（Intel）。
+$SchemeProbe = "probe"
+$SchemeClass = "class"
+
 #  已知版本表
 $KnownVersions = @{
     "2DB8630CB0D73B54135FF972AD82FC053FDEFF5117E67C5DD295EC4020C73276" = @{
         Version = "4.40.1.2090"
         Note    = "1 处"
+        Scheme  = $SchemeClass
         Sites   = @(0x9B172F)
     }
     "AB8ADE084C4F714FE5B21D1324B7E5D13E41BB036D4382E4BC231383B3D56E79" = @{
         Version = "4.42.0.2770"
         Note    = "6 处内联"
+        Scheme  = $SchemeClass
         Sites   = @(0x927A36, 0x927A73, 0x973E48, 0x9765C3, 0x9765F0, 0xB409CF)
+    }
+    "4600AD6F63C20A8EB3098DE2C9FE50A6300F39F882298C7FC3D7F3138DB1DD87" = @{
+        Version = "4.46.0.4716"
+        Note    = "2 处探测闸门"
+        Scheme  = $SchemeProbe
+        Sites   = @(0x933B47, 0x933C83)
     }
 }
 
@@ -33,7 +50,10 @@ $VendorIntel   = 0x8086
 $ClassUnknown  = 5
 $ClassProbe    = 2
 
-# mov r32, imm32 的编码（含 REX.B 形式）
+# probe 方案用 0x7F 顶掉"跳过未知厂商"的判断，5 和 0x7F 都不会再相等
+$ProbeFlag     = 0x7F
+
+# mov r32, imm32 的编码（含 REX.B 形式），仅 class 方案使用
 $MovEncodings = @(
     [pscustomobject]@{ Bytes = [byte[]](0x41, 0xBC); Reg = "r12d" }
     [pscustomobject]@{ Bytes = [byte[]](0x41, 0xBD); Reg = "r13d" }
@@ -67,7 +87,22 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Get-Sha { param($p) (Get-FileHash $p -Algorithm SHA256).Hash }
+#  不用 Get-FileHash：装了 PowerShell 7 的机器上，5.1 的 PSModulePath 会指到 7 的模块目录
+function Get-Sha {
+    param($p)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fs = [System.IO.File]::OpenRead($p)
+        try { return [BitConverter]::ToString($sha.ComputeHash($fs)).Replace("-", "") }
+        finally { $fs.Dispose() }
+    } finally { $sha.Dispose() }
+}
+
+#  读不到时返回 $null，调用方据此退回"直接复制"的处理方式
+function Get-ShaSafe {
+    param($p)
+    try { return (Get-Sha $p) } catch { return $null }
+}
 
 
 #  PE 解析
@@ -117,8 +152,20 @@ function Find-All {
     return , $res
 }
 
-#  定位补丁点
-function Find-PatchSites {
+#  补丁点统一表示：Off 是文件偏移，Orig / Patch 是要写入的字节序列
+function New-Site {
+    param([int]$Off, [byte[]]$Orig, [byte[]]$Patch, [string]$Label, [string]$Scheme)
+    return [pscustomobject]@{
+        Off    = $Off
+        Orig   = $Orig
+        Patch  = $Patch
+        Label  = $Label
+        Scheme = $Scheme
+    }
+}
+
+#  取出 .text 节，同时准备好给 String::IndexOf 用的字节串
+function Get-TextSegment {
     param([byte[]]$Bytes)
 
     $pe   = Get-PeInfo $Bytes
@@ -129,7 +176,55 @@ function Find-PatchSites {
     $len = [int][Math]::Min([int]$text.RawSize, $Bytes.Length - [int]$text.RawPtr)
     $seg = New-Object byte[] $len
     [Array]::Copy($Bytes, [int]$text.RawPtr, $seg, 0, $len)
-    $hay = $Latin1.GetString($seg)
+    return [pscustomobject]@{
+        Seg    = $seg
+        RawPtr = [int]$text.RawPtr
+        Hay    = $Latin1.GetString($seg)
+    }
+}
+
+#  4.46+：解码能力探测里的两处 "厂商分类 == 5 就跳过"
+function Find-ProbeSites {
+    param($Text)
+
+    $seg = $Text.Seg
+    $len = $seg.Length
+    $cur = @(0x05, $ProbeFlag)   # 原版 5、已被本脚本改过的 0x7F 都算命中
+
+    # A: mov r9d, [rcx+0x20] ; cmp r9d, imm8 ; je short
+    $hitA = New-Object System.Collections.Generic.List[int]
+    foreach ($h in (Find-All $Text.Hay (New-Needle @(0x44, 0x8B, 0x49, 0x20, 0x41, 0x83, 0xF9)))) {
+        $o = $h + 7
+        if ($o + 1 -ge $len) { continue }
+        if ($cur -contains $seg[$o] -and $seg[$o + 1] -eq 0x74) { $hitA.Add($o) }
+    }
+
+    # B: cmp dword [rbx+0x20], imm8 ; je rel32
+    $hitB = New-Object System.Collections.Generic.List[int]
+    foreach ($h in (Find-All $Text.Hay (New-Needle @(0x83, 0x7B, 0x20)))) {
+        $o = $h + 3
+        if ($o + 2 -ge $len) { continue }
+        if ($cur -contains $seg[$o] -and $seg[$o + 1] -eq 0x0F -and $seg[$o + 2] -eq 0x84) { $hitB.Add($o) }
+    }
+
+    if ($hitA.Count -ne 1 -or $hitB.Count -ne 1) { return $null }
+    # 两处必须在同一个函数里，且顺序固定
+    if ($hitB[0] -le $hitA[0] -or ($hitB[0] - $hitA[0]) -gt 0x800) { return $null }
+
+    $raw = $Text.RawPtr
+    $res = New-Object System.Collections.Generic.List[object]
+    $res.Add((New-Site ($raw + $hitA[0]) ([byte[]](0x05)) ([byte[]]($ProbeFlag)) "探测闸门 A" $SchemeProbe))
+    $res.Add((New-Site ($raw + $hitB[0]) ([byte[]](0x05)) ([byte[]]($ProbeFlag)) "探测闸门 B" $SchemeProbe))
+    return , $res
+}
+
+#  4.42 及更早：厂商分类器的默认返回值 5 -> 2
+function Find-ClassSites {
+    param($Text)
+
+    $seg = $Text.Seg
+    $len = $seg.Length
+    $hay = $Text.Hay
 
     $intel  = Find-All $hay (New-Needle @(0x86, 0x80, 0x00, 0x00))
     $nvidia = Find-All $hay (New-Needle @(0xDE, 0x10, 0x00, 0x00))
@@ -144,12 +239,12 @@ function Find-PatchSites {
         elseif ($seg[$i - 1] -eq 0x3D) { $isCmp = $true }
         if (-not $isCmp) { continue }
 
-        $near = 0
-        foreach ($x in $nvidia) { if ($i -gt $x -and ($i - $x) -le 64) { $near = $near -bor 1; break } }
-        if (-not ($near -band 1)) { continue }
-        $near = 0
-        foreach ($x in $amd) { if ($i -gt $x -and ($i - $x) -le 64) { $near = $near -bor 1; break } }
-        if (-not ($near -band 1)) { continue }
+        $near = $false
+        foreach ($x in $nvidia) { if ($i -gt $x -and ($i - $x) -le 64) { $near = $true; break } }
+        if (-not $near) { continue }
+        $near = $false
+        foreach ($x in $amd) { if ($i -gt $x -and ($i - $x) -le 64) { $near = $true; break } }
+        if (-not $near) { continue }
 
         $site = $null
         foreach ($want in @($ClassUnknown, $ClassProbe)) {
@@ -166,12 +261,7 @@ function Find-PatchSites {
                     $imm = $o + $enc.Length
                     if ($seg[$imm] -eq $want -and $seg[$imm + 1] -eq 0 -and
                         $seg[$imm + 2] -eq 0 -and $seg[$imm + 3] -eq 0) {
-                        $site = [pscustomobject]@{
-                            MovOff = [int]$text.RawPtr + $o
-                            ImmOff = [int]$text.RawPtr + $imm
-                            Reg    = $m.Reg
-                            Value  = $want
-                        }
+                        $site = [pscustomobject]@{ ImmOff = $imm; Reg = $m.Reg }
                         break
                     }
                 }
@@ -185,28 +275,62 @@ function Find-PatchSites {
     $seen = @{}
     $res  = New-Object System.Collections.Generic.List[object]
     foreach ($s in $hits) {
-        if (-not $seen.ContainsKey($s.ImmOff)) { $seen[$s.ImmOff] = $true; $res.Add($s) }
+        if ($seen.ContainsKey($s.ImmOff)) { continue }
+        $seen[$s.ImmOff] = $true
+        $res.Add((New-Site ([int]$Text.RawPtr + $s.ImmOff) ([byte[]](0x05, 0, 0, 0)) ([byte[]](0x02, 0, 0, 0)) ("厂商分类 " + $s.Reg) $SchemeClass))
     }
     return , $res
 }
 
-function Show-Sites {
-    param($Sites)
-    Say ("       " + (($Sites | ForEach-Object { "0x{0:X}" -f $_.MovOff }) -join "  "))
+#  定位补丁点：先试 4.46+ 的探测闸门，找不到再退回厂商分类方案
+function Find-PatchSites {
+    param([byte[]]$Bytes)
+    $text  = Get-TextSegment $Bytes
+    $sites = Find-ProbeSites $text
+    if (-not $sites) { $sites = Find-ClassSites $text }
+    return , $sites
 }
 
-# 读当前文件里各补丁点的字节
+function Show-Sites {
+    param($Sites)
+    Say ("       " + (($Sites | ForEach-Object { "0x{0:X}" -f $_.Off }) -join "  "))
+}
+
+#  按补丁点读当前文件里的字节，用于展示
 function Get-SiteBytes {
     param([byte[]]$Bytes, $Sites)
-    $vals = New-Object System.Collections.Generic.List[int]
-    foreach ($s in $Sites) { $vals.Add([int]$Bytes[$s.ImmOff]) }
+    $vals = New-Object System.Collections.Generic.List[string]
+    foreach ($s in $Sites) {
+        $n = $s.Orig.Length
+        $t = New-Object System.Collections.Generic.List[string]
+        for ($k = 0; $k -lt $n; $k++) { $t.Add(("{0:x2}" -f $Bytes[$s.Off + $k])) }
+        $vals.Add(($t -join " "))
+    }
     return , $vals
 }
 
-function Test-AllBytes {
-    param($Vals, [int]$Want)
-    foreach ($v in $Vals) { if ($v -ne $Want) { return $false } }
+#  判断所有补丁点是否都处于 Orig / Patch 状态
+function Test-SiteState {
+    param([byte[]]$Bytes, $Sites, [string]$State)
+    foreach ($s in $Sites) {
+        $want = $s.Orig
+        if ($State -eq "Patch") { $want = $s.Patch }
+        if (($s.Off + $want.Length) -gt $Bytes.Length) { return $false }
+        for ($k = 0; $k -lt $want.Length; $k++) {
+            if ($Bytes[$s.Off + $k] -ne $want[$k]) { return $false }
+        }
+    }
     return $true
+}
+
+#  把补丁点批量写成 Orig / Patch 状态
+function Set-SiteState {
+    param([byte[]]$Bytes, $Sites, [string]$State)
+    foreach ($s in $Sites) {
+        $want = $s.Orig
+        if ($State -eq "Patch") { $want = $s.Patch }
+        for ($k = 0; $k -lt $want.Length; $k++) { $Bytes[$s.Off + $k] = $want[$k] }
+    }
 }
 
 #  安装目录探测
@@ -369,7 +493,7 @@ function Test-RestoredDll {
         $b = [System.IO.File]::ReadAllBytes($Path)
         $s = Find-PatchSites $b
         if ($s.Count -eq 0) { return $false }
-        return (Test-AllBytes (Get-SiteBytes $b $s) $ClassUnknown)
+        return (Test-SiteState $b $s "Orig")
     } catch { return $false }
 }
 
@@ -381,12 +505,7 @@ function Test-BackupMatchesCurrent {
         if ($a.Length -ne $b.Length) { return $false }
         $s = Find-PatchSites $b
         if ($s.Count -eq 0) { return $false }
-        foreach ($x in $s) {
-            $b[$x.ImmOff]     = $ClassUnknown
-            $b[$x.ImmOff + 1] = 0
-            $b[$x.ImmOff + 2] = 0
-            $b[$x.ImmOff + 3] = 0
-        }
+        Set-SiteState $b $s "Orig"
         $sha = [System.Security.Cryptography.SHA256]::Create()
         try {
             $ha = [BitConverter]::ToString($sha.ComputeHash($a))
@@ -401,7 +520,14 @@ function Restore-All {
     $did = $false
     if (Test-Path $script:DllStock) {
         if ($Offline) { [void](Stop-UuAll) }
-        if (Copy-WithRetry $script:DllStock $script:Dll) {
+        # 备份和当前文件一样时直接清备份：复制一个被锁住的文件毫无意义
+        $hs  = Get-ShaSafe $script:DllStock
+        $hc  = Get-ShaSafe $script:Dll
+        if ($hs -and $hc -and $hs -eq $hc) {
+            Remove-Item $script:DllStock -Force -ErrorAction SilentlyContinue
+            Remove-Item $script:KeepFlag -Force -ErrorAction SilentlyContinue
+            Ok "streamer.dll 未处于补丁状态，已清理备份"
+        } elseif (Copy-WithRetry $script:DllStock $script:Dll) {
             Remove-Item $script:DllStock -Force -ErrorAction SilentlyContinue
             Remove-Item $script:KeepFlag -Force -ErrorAction SilentlyContinue
             if (Test-RestoredDll $script:Dll) {
@@ -417,11 +543,16 @@ function Restore-All {
         $did = $true
     }
     if (Test-Path $script:DetStock) {
-        if (Copy-WithRetry $script:DetStock $script:Detector) {
+        $hs = Get-ShaSafe $script:DetStock
+        $hc = Get-ShaSafe $script:Detector
+        if ($hs -and $hc -and $hs -eq $hc) {
+            Remove-Item $script:DetStock -Force -ErrorAction SilentlyContinue
+            Ok "StreamerCodecDetector.exe 未处于替换状态，已清理备份"
+        } elseif (Copy-WithRetry $script:DetStock $script:Detector) {
             Remove-Item $script:DetStock -Force -ErrorAction SilentlyContinue
             Ok "StreamerCodecDetector.exe 已还原"
         } else {
-            Bad "无法还原 StreamerCodecDetector.exe"
+            Bad "无法还原 StreamerCodecDetector.exe（文件仍被进程占用）"
         }
         $did = $true
     }
@@ -460,6 +591,7 @@ $script:Detector    = Join-Path $script:InstallDir "StreamerCodecDetector.exe"
 $script:DetStock    = Join-Path $script:InstallDir "StreamerCodecDetector.orig.exe"
 $script:ConfigDir   = Join-Path $script:InstallRoot "config\streamer"
 $script:Cache       = Join-Path $script:ConfigDir "decoder_codec_capability_cache.json"
+$script:EncCache    = Join-Path $script:ConfigDir "encoder_codec_capability_cache.json"
 $script:ShimLog     = Join-Path $env:TEMP "uu_detector_shim.log"
 $script:KeepFlag    = Join-Path $script:InstallDir "uu-remote-keep.flag"
 
@@ -490,17 +622,23 @@ Info ($bytes.Length.ToString() + " 字节   sha256 " + $sha.Substring(0, 16) + "
 
 $sites = Find-PatchSites $bytes
 if ($sites.Count -eq 0) {
-    Bad "未能找到厂商分类代码，无法定位补丁点（文件可能已被修改）。"
+    Bad "未能定位补丁点（文件可能已被其它工具修改，或 UU 又换了实现）。"
     exit 4
 }
 
-$known = $null
+$scheme = $sites[0].Scheme
+$known  = $null
 if ($KnownVersions.ContainsKey($sha.ToUpper())) { $known = $KnownVersions[$sha.ToUpper()] }
 
 if ($known) {
     Ok ("已识别版本 " + $known.Version + "（" + $known.Note + "）")
+    if ($known.Scheme -ne $scheme) {
+        Bad "版本表记录的补丁方案与定位结果不一致，已中止执行。"
+        Say ("       版本表：" + $known.Scheme + "    实际值：" + $scheme)
+        exit 4
+    }
     $exp = @($known.Sites | Sort-Object)
-    $act = @($sites | ForEach-Object { $_.MovOff } | Sort-Object)
+    $act = @($sites | ForEach-Object { $_.Off } | Sort-Object)
     $same = ($exp.Count -eq $act.Count)
     if ($same) {
         for ($i = 0; $i -lt $exp.Count; $i++) { if ($exp[$i] -ne $act[$i]) { $same = $false; break } }
@@ -515,6 +653,11 @@ if ($known) {
     Warn "不在已知版本表（UU远程可能已更新），将使用模式定位..."
 }
 
+if ($scheme -eq $SchemeProbe) {
+    Info "方案：探测闸门（4.46+），不改厂商分类，编码器仍走软件路径"
+} else {
+    Info "方案：厂商分类 5 -> 2（旧版本）"
+}
 Ok ("已定位 " + $sites.Count + " 个补丁点")
 Show-Sites $sites
 
@@ -522,7 +665,7 @@ $curVals = Get-SiteBytes $bytes $sites
 
 # 上次运行选择保留修改版
 if (Test-Path $script:KeepFlag) {
-    if (Test-AllBytes $curVals $ClassProbe) {
+    if (Test-SiteState $bytes $sites "Patch") {
         Warn "已检测到补丁状态。未修改补丁文件，如需还原，请使用-Restore。"
         exit 0
     }
@@ -531,7 +674,8 @@ if (Test-Path $script:KeepFlag) {
 }
 
 # 上次运行中断
-if ((Test-Path $script:DllStock) -or (Test-Path $script:DetStock)) {
+# DryRun 不碰任何文件，残留留到正式运行时处理
+if (-not $DryRun -and ((Test-Path $script:DllStock) -or (Test-Path $script:DetStock))) {
     if ((Test-Path $script:DllStock) -and -not (Test-BackupMatchesCurrent $script:DllStock $script:Dll)) {
         Warn "备份与当前文件版本不一致（UU远程可能已更新），将跳过自动还原。"
         Move-Item $script:DllStock ($script:DllStock + ".old") -Force -ErrorAction SilentlyContinue
@@ -540,20 +684,24 @@ if ((Test-Path $script:DllStock) -or (Test-Path $script:DetStock)) {
         Warn "检测到上次运行未正常结束，正在还原..."
         Restore-All | Out-Null
         $bytes = [System.IO.File]::ReadAllBytes($script:Dll)
-        if (Test-AllBytes (Get-SiteBytes $bytes $sites) $ClassUnknown) { Ok "残留已清理" }
+        if (Test-SiteState $bytes $sites "Orig") { Ok "残留已清理" }
         else { Bad "残留清理失败，请手动 -Restore"; exit 4 }
         $curVals = Get-SiteBytes $bytes $sites
     }
 }
 
 # 状态判定
-if (Test-AllBytes $curVals $ClassProbe) {
-    Warn "补丁已应用，且无备份可供还原（如需恢复官方版本，请重新安装 UU远程）。"
+if (Test-SiteState $bytes $sites "Patch") {
+    if (Test-Path $script:DllStock) {
+        Warn "补丁已应用（安装目录里还有备份）。如需还原，请执行 -Restore。"
+    } else {
+        Warn "补丁已应用，且无备份可供还原（如需恢复官方版本，请重新安装 UU远程）。"
+    }
     exit 0
 }
-if (-not (Test-AllBytes $curVals $ClassUnknown)) {
+if (-not (Test-SiteState $bytes $sites "Orig")) {
     Bad "补丁点字节异常，文件可能已被其它工具修改。"
-    Say ("       实际值：" + (($curVals | ForEach-Object { $_.ToString("x2") }) -join " "))
+    Say ("       实际值：" + ($curVals -join "  "))
     exit 4
 }
 Ok "补丁点校验通过"
@@ -585,16 +733,11 @@ try {
     Ok "已备份为 streamer.dll.stock"
 
     $bytes = [System.IO.File]::ReadAllBytes($script:DllStock)
-    foreach ($s in $sites) {
-        $bytes[$s.ImmOff]     = $ClassProbe
-        $bytes[$s.ImmOff + 1] = 0
-        $bytes[$s.ImmOff + 2] = 0
-        $bytes[$s.ImmOff + 3] = 0
-    }
+    Set-SiteState $bytes $sites "Patch"
     [System.IO.File]::WriteAllBytes($script:Dll, $bytes)
 
     $chk = [System.IO.File]::ReadAllBytes($script:Dll)
-    if (Test-AllBytes (Get-SiteBytes $chk $sites) $ClassProbe) {
+    if (Test-SiteState $chk $sites "Patch") {
         Ok ("已写入 " + $sites.Count + " 处")
     } else {
         Bad "写入后校验未通过，正在还原"
@@ -679,12 +822,21 @@ __SHIM_B64__
         $j = Get-Content $script:Cache -Raw -Encoding UTF8 | ConvertFrom-Json
         Say ("       version " + $j.version + "   指纹 " + $j.gpu_fingerprint +
              "   条目 " + @($j.decoder_capabilities).Count)
-        $impl = @{ 32 = "DXVA11"; 33 = "NvDec"; 34 = "VideoToolbox"; 35 = "AsyncMediaCodec"; 36 = "SyncMediaCodec"; 37 = "Software" }
+        $impl = @{ 32 = "DXVA11"; 33 = "NvDec"; 34 = "VideoToolbox"; 35 = "AsyncMediaCodec"; 36 = "SyncMediaCodec"; 37 = "Software"; 38 = "AMF"; 39 = "oneVPL" }
+        # 同一厂商编号下可能挂了多个适配器（例如独显 + Microsoft Basic Render Driver），
+        # 每个适配器各记一份，所以同一组参数会出现多条，属正常现象
+        $rows = [ordered]@{}
         foreach ($c in (@($j.decoder_capabilities) | Where-Object { $_.codec_impl -ne 37 })) {
             $cn = if ($c.video_codec -eq 1) { "H.264" } else { "H.265" }
-            $res = if ($c.width -eq 0) { "任意尺寸" } else { "$($c.width)x$($c.height)" }
-            $im = if ($impl.ContainsKey([int]$c.codec_impl)) { $impl[[int]$c.codec_impl] } else { $c.codec_impl }
-            Say ("       {0}  chroma={1} {2}bit  {3}  {4}" -f $cn, $c.chroma_sampling, $c.bit_depth, $res, $im)
+            $res = if ($c.width -eq 0) { "不支持" } else { "$($c.width)x$($c.height)" }
+            $im = if ($impl.ContainsKey([int]$c.codec_impl)) { $impl[[int]$c.codec_impl] } else { "$($c.codec_impl)" }
+            $key = ("{0}  chroma={1} {2}bit  {3}  {4}" -f $cn, $c.chroma_sampling, $c.bit_depth, $res, $im)
+            if ($rows.Contains($key)) { $rows[$key] = $rows[$key] + 1 }
+            else { $rows[$key] = 1 }
+        }
+        foreach ($k in $rows.Keys) {
+            if ($rows[$k] -gt 1) { Say ("       " + $k + ("  x" + $rows[$k])) }
+            else                 { Say ("       " + $k) }
         }
         Say ""
         if ($keep) { Say "   当前状态：已保留补丁" }
