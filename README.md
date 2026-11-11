@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File .\uu-remote-patcher.ps1 -Restore
 
 ### 问题
 
-被控端画质菜单里选「原画」被拒绝，提示类似：
+控制端画质菜单里选「原画」被拒绝，提示类似：
 
 ```
 设备性能受限，最高支持高清画质
